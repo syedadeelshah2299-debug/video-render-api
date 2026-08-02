@@ -20,8 +20,9 @@ jobs:
         run: |
           mkdir assets
           curl -L "${{ github.event.inputs.images_zip_url }}" -o assets/images.zip
-          curl -L "${{ github.event.inputs.audio_url }}" -o assets/audio.mp3
-          cd assets && unzip images.zip -d images
+          curl -L "${{ github.event.inputs.audio_url }}" -o assets/audio.zip
+          cd assets && unzip -o images.zip -d images
+          cd assets && unzip -o audio.zip -d audio
           
       - name: Install FFmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
