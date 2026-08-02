@@ -4,10 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       images_zip_url:
-        description: 'URL of images zip or direct URL'
+        description: 'Base64 string or ZIP URL'
         required: true
       audio_url:
-        description: 'URL of audio file'
+        description: 'Base64 string or Audio URL'
         required: true
 
 jobs:
@@ -19,63 +19,60 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install FFmpeg & Tools
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg unzip wget
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg unzip jq
 
-      - name: Download & Clean Assets
+      - name: Decode Base64 Assets
         run: |
           mkdir -p raw_assets assets/images assets/audio frames
-          
-          # Download Image Input
-          curl -L "${{ github.event.inputs.images_zip_url }}" -o raw_assets/images_input
-          
-          # Try extracting as ZIP, if fails treat as direct file
-          if unzip -o raw_assets/images_input -d raw_assets/img_extracted/ ; then
-            echo "Successfully unzipped images"
-            find raw_assets/img_extracted -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" \) | sort | while read -r file; do
-              mv "$file" assets/images/
-            done
+
+          # Process Images Input
+          INPUT_IMG="${{ github.event.inputs.images_zip_url }}"
+          if [[ "$INPUT_IMG" =~ ^http ]]; then
+            curl -L "$INPUT_IMG" -o raw_assets/images.zip
+            unzip -o raw_assets/images.zip -d assets/images/
           else
-            echo "Not a zip, moving direct file"
-            mv raw_assets/images_input assets/images/scene_001.png
+            echo "$INPUT_IMG" | base64 -d > raw_assets/images.zip
+            unzip -o raw_assets/images.zip -d assets/images/ || unzip -o raw_assets/images.zip -d assets/images/ || true
           fi
 
-          # Download Audio Input
-          curl -L "${{ github.event.inputs.audio_url }}" -o raw_assets/audio_input
-          if unzip -o raw_assets/audio_input -d raw_assets/aud_extracted/ ; then
-            find raw_assets/aud_extracted -type f \( -iname "*.mp3" -o -iname "*.wav" \) | while read -r file; do
-              mv "$file" assets/audio/
-            done
+          # Move all images to root assets directory
+          find assets/images/ -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" \) | sort | while read -r file; do
+            mv "$file" assets/images/
+          done
+
+          # Process Audio Input
+          INPUT_AUD="${{ github.event.inputs.audio_url }}"
+          if [[ "$INPUT_AUD" =~ ^http ]]; then
+            curl -L "$INPUT_AUD" -o assets/audio/main_audio.mp3
           else
-            mv raw_assets/audio_input assets/audio/main_audio.mp3
+            echo "$INPUT_AUD" | base64 -d > assets/audio/main_audio.mp3
           fi
 
-      - name: Process Scenes & Render Video
+      - name: Render Animated Clips & Concat Video
         run: |
           set -e
           mkdir -p frames
           
-          # Process every image to 3-second animated scene clip
           i=0
           for img in $(ls assets/images/* | sort -V); do
             i=$((i+1))
             formatted_index=$(printf "%03d" $i)
-            echo "Rendering Frame $i: $img"
+            echo "Processing Frame $i: $img"
             
             ffmpeg -y -loop 1 -i "$img" \
             -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,zoompan=z='min(pzoom+0.0015,1.15)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=90:s=1080x1920:fps=30" \
             -t 3 -pix_fmt yuv420p "frames/scene_${formatted_index}.mp4"
           done
 
-          # Create concat list
+          # Concat scenes
           rm -f concat_list.txt
           for f in $(ls frames/scene_*.mp4 | sort); do
             echo "file '$f'" >> concat_list.txt
           done
 
-          # Concat all scenes
           ffmpeg -y -f concat -safe 0 -i concat_list.txt -c copy temp_video.mp4
 
-          # Sync with audio length
+          # Audio Syncing
           AUDIO_FILE=$(ls assets/audio/* | head -n 1)
           AUDIO_DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$AUDIO_FILE")
 
