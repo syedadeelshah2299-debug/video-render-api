@@ -23,78 +23,72 @@ jobs:
       - name: Install FFmpeg & Tools
         run: sudo apt-get update && sudo apt-get install -y ffmpeg unzip jq
 
-      - name: Decode Base64 Assets
+      - name: Decode & Fetch Assets
         run: |
           mkdir -p raw_assets assets/images assets/audio frames
 
-          # Determine Inputs from Dispatch Payload or Workflow Inputs
           INPUT_IMG="${{ github.event.client_payload.images_zip_url || github.event.inputs.images_zip_url }}"
           INPUT_AUD="${{ github.event.client_payload.audio_url || github.event.inputs.audio_url }}"
-          EXEC_ID="${{ github.event.client_payload.execution_id }}"
 
-          # 1. Process Images Input
+          # Fetch Images ZIP
           if [[ "$INPUT_IMG" =~ ^http ]]; then
             curl -L -s "$INPUT_IMG" -o raw_assets/images.zip || true
             unzip -o raw_assets/images.zip -d assets/images/ || true
-          elif [ -n "$INPUT_IMG" ]; then
-            echo "$INPUT_IMG" | base64 -d > raw_assets/images.zip 2>/dev/null || true
-            unzip -o raw_assets/images.zip -d assets/images/ || true
-          elif [ -n "$EXEC_ID" ] && [ -f "renders/${EXEC_ID}/images.zip" ]; then
-            unzip -o "renders/${EXEC_ID}/images.zip" -d assets/images/ || true
           fi
 
-          # Move all nested images to root assets/images directory
+          # Extract inner image files if zipped in subfolders
           find assets/images/ -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" \) -exec mv {} assets/images/ \; 2>/dev/null || true
 
-          # 2. Process Audio Input
+          # Fetch Audio File
           if [[ "$INPUT_AUD" =~ ^http ]]; then
             curl -L -s "$INPUT_AUD" -o assets/audio/main_audio.mp3 || true
-          elif [ -n "$INPUT_AUD" ]; then
-            echo "$INPUT_AUD" | base64 -d > assets/audio/main_audio.mp3 2>/dev/null || true
-          elif [ -n "$EXEC_ID" ] && [ -f "renders/${EXEC_ID}/audio.mp3" ]; then
-            cp "renders/${EXEC_ID}/audio.mp3" assets/audio/main_audio.mp3
           fi
 
-      - name: Render Animated Clips & Concat Video
+      - name: Render Video & Sync Full Audio
         run: |
           set -e
           mkdir -p frames assets/images assets/audio
 
-          # Check if images exist, if not create a fallback frame
+          # 1. Get exact duration of audio
+          AUDIO_FILE=$(find assets/audio -type f 2>/dev/null | head -n 1)
+          if [ -n "$AUDIO_FILE" ] && [ -s "$AUDIO_FILE" ]; then
+            AUDIO_DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$AUDIO_FILE")
+          else
+            AUDIO_DUR="10"
+          fi
+
+          echo "Audio Duration: $AUDIO_DUR seconds"
+
+          # 2. Check if images exist
           IMAGE_COUNT=$(find assets/images -maxdepth 1 -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" \) 2>/dev/null | wc -l)
           
           if [ "$IMAGE_COUNT" -eq 0 ]; then
-            echo "No images found! Creating fallback black frame."
-            ffmpeg -y -f lavfi -i color=c=black:s=1080x1920:d=3 -frames:v 1 assets/images/scene_default.png
+            echo "CRITICAL WARNING: No images found! Generating blue fallback frame."
+            ffmpeg -y -f lavfi -i color=c=0x1a1a2e:s=1080x1920:d=5 -frames:v 1 assets/images/fallback.png
           fi
 
+          # 3. Process scenes
           i=0
           rm -f concat_list.txt
           
-          # Render scenes with Zoompan animation
           for img in $(find assets/images -maxdepth 1 -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" \) | sort -V); do
             i=$((i+1))
             formatted_index=$(printf "%03d" $i)
-            echo "Processing Frame $i: $img"
             
             ffmpeg -y -loop 1 -i "$img" \
-            -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,zoompan=z='min(pzoom+0.0015,1.15)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=90:s=1080x1920:fps=30" \
-            -t 3 -pix_fmt yuv420p "frames/scene_${formatted_index}.mp4"
+            -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,zoompan=z='min(pzoom+0.0015,1.15)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=150:s=1080x1920:fps=30" \
+            -t 5 -pix_fmt yuv420p "frames/scene_${formatted_index}.mp4"
             
             echo "file 'frames/scene_${formatted_index}.mp4'" >> concat_list.txt
           done
 
-          # Concat all rendered scene clips
+          # 4. Loop video to match total audio length perfectly
           ffmpeg -y -f concat -safe 0 -i concat_list.txt -c copy temp_video.mp4
 
-          # Sync Audio if exists
-          AUDIO_FILE=$(find assets/audio -type f 2>/dev/null | head -n 1)
-          
+          # 5. Merge Full Audio with Looped Video
           if [ -n "$AUDIO_FILE" ] && [ -s "$AUDIO_FILE" ]; then
-            AUDIO_DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$AUDIO_FILE" || echo "10")
-            ffmpeg -y -stream_loop -1 -i temp_video.mp4 -i "$AUDIO_FILE" -c:v libx264 -c:a aac -shortest -t "$AUDIO_DUR" output.mp4
+            ffmpeg -y -stream_loop -1 -i temp_video.mp4 -i "$AUDIO_FILE" -c:v libx264 -c:a aac -map 0:v:0 -map 1:a:0 -shortest -t "$AUDIO_DUR" output.mp4
           else
-            echo "No audio file found, using silent video as final output."
             mv temp_video.mp4 output.mp4
           fi
 
